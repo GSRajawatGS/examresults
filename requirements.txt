@@ -1,0 +1,9 @@
+# pip install -r requirements.txt     (then once: playwright install chromium)
+streamlit>=1.30
+pandas
+openpyxl
+pdfplumber
+playwright
+ddddocr
+supabase
+python-dotenv
