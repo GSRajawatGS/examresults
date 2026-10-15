@@ -258,3 +258,129 @@ def student_card(frames, session, code, roll):
 
     st, ms, pp = pick(frames["students"]), pick(frames["marksheets"]), pick(frames["papers"])
     return (st.iloc[0].dropna().to_dict() if len(st) else {}, ms.iloc[0].dropna().to_dict() if len(ms) else {}, pp)
+
+
+# ----------------------------------------------------------------------------
+# One student, every exam
+# ----------------------------------------------------------------------------
+def _clean_dict(d, drop=("id", "updated_at", "raw_text")):
+    out = {}
+    for k, v in d.items():
+        if k in drop or v is None or (isinstance(v, float) and v != v):
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
+
+
+def find_student(frames, query, link_enrollment=True):
+    """Everything known about a student, found by roll number (or enrollment number).
+
+    link_enrollment: also take this student's exams under OTHER roll numbers (same enrollment number).
+    Returns a dict: found, query, rolls, profile, names, exams (DataFrame), details (one entry per exam)."""
+    q = str(query).strip()
+    st, ms, pp = frames["students"], frames["marksheets"], frames["papers"]
+    res = {"query": q, "found": False, "rolls": [], "profile": {}, "names": [], "exams": pd.DataFrame(),
+           "details": [], "linked": False}
+    if not q or st.empty:
+        return res
+
+    base = st[st["roll_no"].astype(str) == q]
+    if base.empty:                                           # maybe an enrollment number was typed
+        base = st[st["enrollment_no"].fillna("").astype(str).str.upper() == q.upper()]
+    if base.empty:
+        return res
+    rolls = set(base["roll_no"].astype(str))
+    enrolls = set(base["enrollment_no"].dropna().astype(str))
+    if link_enrollment and enrolls:
+        linked = st[st["enrollment_no"].isin(enrolls)]
+        res["linked"] = set(linked["roll_no"].astype(str)) != rolls
+        rolls |= set(linked["roll_no"].astype(str))
+
+    students = st[st["roll_no"].astype(str).isin(rolls)].copy()
+    keys = ["session", "exam_code", "roll_no"]
+    marks = ms[ms["roll_no"].astype(str).isin(rolls)] if not ms.empty else ms
+    papers = pp[pp["roll_no"].astype(str).isin(rolls)] if not pp.empty else pp
+
+    merged = prepare(students.drop(columns=[c for c in ("id", "updated_at") if c in students]).merge(
+        marks.drop(columns=[c for c in ("id", "updated_at", "extra", "raw_text") if c in marks]), on=keys, how="left"))
+    merged["_order"] = merged["session"].map(session_sort_key)
+    merged = merged.sort_values(["_order", "exam_code"], ascending=[False, True]).drop(columns="_order")
+    cols = ["session", "exam_code", "class_label", "roll_no", "att_status", "att_regular_private", "result_status",
+            "result_exam_code", "final_result", "total_obtained", "total_max", "percentage", "division"]
+    res["exams"] = merged[[c for c in cols if c in merged]].reset_index(drop=True)
+
+    details = []
+    for _, row in merged.iterrows():
+        k = {"session": row["session"], "exam_code": row["exam_code"], "roll_no": row["roll_no"]}
+        m = marks[(marks["session"] == k["session"]) & (marks["exam_code"] == k["exam_code"])
+                  & (marks["roll_no"] == k["roll_no"])] if not marks.empty else marks
+        md = _clean_dict(m.iloc[0].to_dict()) if len(m) else {}
+        extra = md.pop("extra", None)
+        if isinstance(extra, dict):
+            md.update(extra)
+        for drop in ("session", "exam_code", "roll_no"):
+            md.pop(drop, None)
+        p = papers[(papers["session"] == k["session"]) & (papers["exam_code"] == k["exam_code"])
+                   & (papers["roll_no"] == k["roll_no"])] if not papers.empty else papers
+        rows = []
+        for _, pr in p.iterrows():
+            comps = pr.get("components") or {}
+            rows.append({"paper": pr["paper"], **{str(a): b for a, b in comps.items()}})
+        details.append({"key": k, "class_label": row.get("class_label"), "result": row.get("final_result"),
+                        "status": row.get("result_status"), "marksheet": md, "papers": pd.DataFrame(rows)})
+    res["details"] = details
+
+    prof_rows = students.copy()
+    prof_rows["_order"] = prof_rows["session"].map(session_sort_key)
+    latest = prof_rows.sort_values("_order", ascending=False).iloc[0]
+    res["profile"] = _clean_dict({k: latest.get(k) for k in (
+        "name", "father_name", "mother_name", "enrollment_no", "gender", "category", "address", "college_name",
+        "exam_centre") if k in latest})
+    res["names"] = sorted({str(x).strip().upper() for x in students["name"].dropna()})
+    res["rolls"] = sorted(rolls)
+    res["found"] = True
+    return res
+
+
+def student_extras(res, attestation=None, sitting=None):
+    """Adds the attestation-PDF rows and the sitting-plan papers of the student's roll numbers."""
+    rolls = set(res.get("rolls") or [])
+    out = {"attestation": pd.DataFrame(), "sitting": pd.DataFrame()}
+    if attestation is not None and not attestation.empty and rolls:
+        a = attestation[attestation["roll_no"].astype(str).isin(rolls)]
+        out["attestation"] = a[[c for c in ("session", "tag", "roll_no", "course", "branch", "sem", "status",
+                                            "papers", "exam_centre") if c in a]].reset_index(drop=True)
+    if sitting is not None and not sitting.empty and rolls:
+        hit = sitting[sitting["rolls"].map(lambda r: bool(rolls & set(r or [])))]
+        out["sitting"] = hit[[c for c in ("session", "tag", "paper_code", "paper_name", "sem", "status",
+                                          "exam_centre") if c in hit]].reset_index(drop=True)
+    return out
+
+
+def student_workbook(res, extras=None):
+    """The whole search result as an Excel file (bytes): Profile, Exams, Marksheets, Papers, Attestation, Sitting."""
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        prof = {"roll numbers": ", ".join(res.get("rolls", [])), **res.get("profile", {})}
+        pd.DataFrame({"field": list(prof), "value": [str(v) for v in prof.values()]}).to_excel(xw, sheet_name="Profile", index=False)
+        res["exams"].to_excel(xw, sheet_name="Exams", index=False)
+        marks, papers = [], []
+        for d in res["details"]:
+            tag = {"session": d["key"]["session"], "exam_code": d["key"]["exam_code"], "roll_no": d["key"]["roll_no"]}
+            marks.append({**tag, **{k: (v if isinstance(v, (int, float, str)) else str(v)) for k, v in d["marksheet"].items()}})
+            for _, r in d["papers"].iterrows():
+                papers.append({**tag, **r.to_dict()})
+        pd.DataFrame(marks).to_excel(xw, sheet_name="Marksheets", index=False)
+        pd.DataFrame(papers).to_excel(xw, sheet_name="Papers", index=False)
+        for name, key in (("Attestation PDFs", "attestation"), ("Sitting plans", "sitting")):
+            df = (extras or {}).get(key)
+            if df is not None and not df.empty:
+                df.to_excel(xw, sheet_name=name, index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                width = min(max((len(str(c.value)) for c in col if c.value is not None), default=8) + 2, 50)
+                ws.column_dimensions[col[0].column_letter].width = width
+    return buf.getvalue()
