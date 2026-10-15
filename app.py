@@ -37,7 +37,7 @@ KNOWN_LINKS = {
 }
 REQUIRED_FILES = ["mponline.py", "jobs.py", "result_scraper.py", "result_jobs.py", "result_report.py", "analytics.py",
                   "db.py", "db_sync.py", "runner.py", "run_adhoc.py", "portal_options.py", "supabase_schema.sql"]
-PAGES = ["Download", "Run tasks", "Results", "Statistics", "Attestation data", "Sitting plans", "Files & backfill",
+PAGES = ["Download", "Run tasks", "Results", "Student search", "Statistics", "Attestation data", "Sitting plans", "Files & backfill",
          "Database"]
 
 # (what, normal / NEP) -> (task, key in portal_options.py, link of the portal page, folder tag, levels)
@@ -440,6 +440,86 @@ def page_results(source):
 
 
 # ----------------------------------------------------------------------------
+# Page: Student search (one roll number -> every exam, in detail)
+# ----------------------------------------------------------------------------
+def page_student(source):
+    st.header("Student search")
+    c1, c2 = st.columns([2, 3])
+    q = c1.text_input("Roll number (or enrollment number)", key="student_query").strip()
+    link = c2.checkbox("Also include this student's exams under other roll numbers (same enrollment number)", value=True)
+    extras_on = st.checkbox("Also look in the attestation PDFs and the sitting plans", value=True)
+    if not q:
+        st.info("Type a roll number (or an enrollment number) to see every exam of that student: result, marks of "
+                "every paper, attestation sheet and sitting plan.")
+        return
+    frames, df = need_data(source)
+    if frames is None:
+        return
+
+    att = sit = None
+    if extras_on:
+        try:
+            att = load_attestation(source, str(docs_folder()))
+            sit = load_sitting(source, str(docs_folder()))
+        except Exception as e:
+            st.caption(f"(attestation PDFs / sitting plans not available: {type(e).__name__})")
+
+    res = an.find_student(frames, q, link)
+    if not res["found"]:
+        st.warning(f"No exam with the roll number / enrollment number {q} was found in the results data.")
+        if att is not None and not att.empty:
+            hit = att[att["roll_no"].astype(str) == q]
+            if len(hit):
+                st.info("It is in the attestation PDFs, but no results have been fetched for it yet:")
+                st.dataframe(hit[["session", "tag", "roll_no", "name", "course", "branch", "sem", "status"]],
+                             hide_index=True)
+        return
+
+    extras = an.student_extras(res, att, sit)
+    ex = res["exams"]
+    p = res["profile"]
+    st.subheader(p.get("name", q))
+    a, b = st.columns([3, 2])
+    a.table(pd.DataFrame({"field": list(p), "value": [str(v) for v in p.values()]}))
+    passed = int(ex["division"].ne("").sum()) if "division" in ex else 0
+    found = int(ex["result_status"].eq("OK").sum()) if "result_status" in ex else 0
+    b.metric("Exams", len(ex))
+    b.metric("Results found", found)
+    b.metric("Passed (with percentage)", passed)
+    b.markdown("**Roll numbers:** " + ", ".join(res["rolls"]))
+    if res["linked"]:
+        st.info("This student has more than one roll number (same enrollment number); all their exams are shown.")
+    if len(res["names"]) > 1:
+        st.warning("The name is spelled differently in different exams: " + "; ".join(res["names"]))
+
+    st.markdown("**All exams**")
+    st.dataframe(ex, hide_index=True)
+
+    st.markdown("**Every exam in detail**")
+    for i, d in enumerate(res["details"]):
+        k = d["key"]
+        title = f"{k['session']}  |  {d.get('class_label') or k['exam_code']}  |  roll {k['roll_no']}  |  " \
+                f"{d['result'] if isinstance(d['result'], str) else (d['status'] or 'no result yet')}"
+        with st.expander(title, expanded=(i == 0)):
+            if d["marksheet"]:
+                st.table(pd.DataFrame({"field": list(d["marksheet"]), "value": [str(v) for v in d["marksheet"].values()]}))
+            else:
+                st.caption("No marksheet fetched for this exam yet.")
+            if len(d["papers"]):
+                st.dataframe(d["papers"], hide_index=True)
+
+    if len(extras["attestation"]):
+        st.markdown("**Attestation sheets (PDFs)**")
+        st.dataframe(extras["attestation"], hide_index=True)
+    if len(extras["sitting"]):
+        st.markdown("**Sitting plans**")
+        st.dataframe(extras["sitting"], hide_index=True)
+    st.download_button("Download everything about this student (Excel)", an.student_workbook(res, extras),
+                       file_name=f"student_{q}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ----------------------------------------------------------------------------
 # Page: Statistics
 # ----------------------------------------------------------------------------
 def page_stats(source):
@@ -689,6 +769,8 @@ def main():
         page_attestation(source)
     elif page == "Results":
         page_results(source)
+    elif page == "Student search":
+        page_student(source)
     elif page == "Statistics":
         page_stats(source)
     elif page == "Sitting plans":
