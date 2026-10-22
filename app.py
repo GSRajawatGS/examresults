@@ -445,12 +445,14 @@ def page_results(source):
 def page_student(source):
     st.header("Student search")
     c1, c2 = st.columns([2, 3])
-    q = c1.text_input("Roll number (or enrollment number)", key="student_query").strip()
+    q = c1.text_input("Roll number, enrollment number or name", key="student_query").strip()
     link = c2.checkbox("Also include this student's exams under other roll numbers (same enrollment number)", value=True)
-    extras_on = st.checkbox("Also look in the attestation PDFs and the sitting plans", value=True)
+    c3, c4 = st.columns(2)
+    extras_on = c3.checkbox("Also look in the attestation PDFs and the sitting plans", value=True)
+    parents = c4.checkbox("Names: also search the father's and mother's name", value=False)
     if not q:
-        st.info("Type a roll number (or an enrollment number) to see every exam of that student: result, marks of "
-                "every paper, attestation sheet and sitting plan.")
+        st.info("Type a roll number, an enrollment number or a name (or part of it, e.g. 'akash') to see every exam "
+                "of that student: result, marks of every paper, attestation sheet and sitting plan.")
         return
     frames, df = need_data(source)
     if frames is None:
@@ -464,11 +466,30 @@ def page_student(source):
         except Exception as e:
             st.caption(f"(attestation PDFs / sitting plans not available: {type(e).__name__})")
 
-    res = an.find_student(frames, q, link)
-    if not res["found"]:
+    res = an.find_student(frames, q, link)                 # a roll number or an enrollment number
+    if not res["found"] and any(ch.isalpha() for ch in q):  # otherwise: a name, or part of one
+        people = an.search_students(frames, q, include_parents=parents)
+        if people.empty:
+            st.warning(f"No student whose name contains '{q}' was found in the results data.")
+            close = an.similar_names(frames, q)
+            if close:
+                st.info("Did you mean: " + ", ".join(close))
+            return
+        st.markdown(f"**{len(people)} student(s) match '{q}'**" + (" (the first 200 are shown - type more of the name)"
+                                                                   if len(people) >= 200 else ""))
+        shown = people.copy()
+        shown["rolls"] = shown["rolls"].map(lambda r: ", ".join(r))
+        st.dataframe(shown[["name", "father_name", "enrollment_no", "rolls", "exams", "last_exam"]], hide_index=True)
+        labels = [f"{r['name']}  -  father: {r['father_name']}  -  {r['enrollment_no'] or 'no enrollment no.'}  -  "
+                  f"{r['exams']} exam(s), last: {r['last_exam']}" for _, r in people.iterrows()]
+        pick = st.selectbox("Which student?", list(range(len(people))), format_func=lambda i: labels[i],
+                            key=f"student_pick_{q}_{parents}")
+        person = people.iloc[pick]
+        res = an.student_for_rolls(frames, person["rolls"], person["name"])
+    elif not res["found"]:
         st.warning(f"No exam with the roll number / enrollment number {q} was found in the results data.")
         if att is not None and not att.empty:
-            hit = att[att["roll_no"].astype(str) == q]
+            hit = att[(att["roll_no"].astype(str) == q) | (att["enrollment_no"].fillna("").astype(str).str.upper() == q.upper())]
             if len(hit):
                 st.info("It is in the attestation PDFs, but no results have been fetched for it yet:")
                 st.dataframe(hit[["session", "tag", "roll_no", "name", "course", "branch", "sem", "status"]],
@@ -498,8 +519,8 @@ def page_student(source):
     st.markdown("**Every exam in detail**")
     for i, d in enumerate(res["details"]):
         k = d["key"]
-        title = f"{k['session']}  |  {d.get('class_label') or k['exam_code']}  |  roll {k['roll_no']}  |  " \
-                f"{d['result'] if isinstance(d['result'], str) else (d['status'] or 'no result yet')}"
+        outcome = d["result"] if isinstance(d["result"], str) else (d["status"] if isinstance(d["status"], str) else "no result yet")
+        title = f"{k['session']}  |  {d.get('class_label') or k['exam_code']}  |  roll {k['roll_no']}  |  {outcome}"
         with st.expander(title, expanded=(i == 0)):
             if d["marksheet"]:
                 st.table(pd.DataFrame({"field": list(d["marksheet"]), "value": [str(v) for v in d["marksheet"].values()]}))
@@ -762,24 +783,3 @@ def main():
             st.error("Missing next to app.py: " + ", ".join(gone))
 
     if page == "Download":
-        page_download()
-    elif page == "Run tasks":
-        page_run()
-    elif page == "Attestation data":
-        page_attestation(source)
-    elif page == "Results":
-        page_results(source)
-    elif page == "Student search":
-        page_student(source)
-    elif page == "Statistics":
-        page_stats(source)
-    elif page == "Sitting plans":
-        page_sitting(source)
-    elif page == "Files & backfill":
-        page_files()
-    else:
-        page_database()
-
-
-if __name__ == "__main__":
-    main()
