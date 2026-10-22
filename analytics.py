@@ -298,14 +298,6 @@ def find_student(frames, query, link_enrollment=True):
         res["linked"] = set(linked["roll_no"].astype(str)) != rolls
         rolls |= set(linked["roll_no"].astype(str))
 
-    return _build_student(frames, rolls, q, res["linked"])
-
-
-def _build_student(frames, rolls, q, linked=False):
-    """The full result (profile, exams, details) for a set of roll numbers."""
-    st, ms, pp = frames["students"], frames["marksheets"], frames["papers"]
-    res = {"query": q, "found": False, "rolls": [], "profile": {}, "names": [], "exams": pd.DataFrame(),
-           "details": [], "linked": linked}
     students = st[st["roll_no"].astype(str).isin(rolls)].copy()
     keys = ["session", "exam_code", "roll_no"]
     marks = ms[ms["roll_no"].astype(str).isin(rolls)] if not ms.empty else ms
@@ -352,35 +344,43 @@ def _build_student(frames, rolls, q, linked=False):
     return res
 
 
-def _person_key(row):
-    enr = str(row.get("enrollment_no") or "").strip().upper()
-    if enr and enr != "NAN":
-        return "E:" + enr
-    return "N:" + norm_name(row.get("name")) + "|" + norm_name(row.get("father_name"))
+def student_extras(res, attestation=None, sitting=None):
+    """Adds the attestation-PDF rows and the sitting-plan papers of the student's roll numbers."""
+    rolls = set(res.get("rolls") or [])
+    out = {"attestation": pd.DataFrame(), "sitting": pd.DataFrame()}
+    if attestation is not None and not attestation.empty and rolls:
+        a = attestation[attestation["roll_no"].astype(str).isin(rolls)]
+        out["attestation"] = a[[c for c in ("session", "tag", "roll_no", "course", "branch", "sem", "status",
+                                            "papers", "exam_centre") if c in a]].reset_index(drop=True)
+    if sitting is not None and not sitting.empty and rolls:
+        hit = sitting[sitting["rolls"].map(lambda r: bool(rolls & set(r or [])))]
+        out["sitting"] = hit[[c for c in ("session", "tag", "paper_code", "paper_name", "sem", "status",
+                                          "exam_centre") if c in hit]].reset_index(drop=True)
+    return out
 
 
-def norm_name(text):
-    return re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
-
-
-def search_students(frames, query, include_parents=False, limit=200):
-    """Students whose name contains every word of `query` (any order, any case, part of a word is enough):
-    'akash' finds Akash Sharma, Akash Verma, Ram Akash, Aakash ...
-    One row per PERSON (same enrollment number, else same name + father), with all of their roll numbers."""
-    words = [w for w in re.split(r"\s+", str(query).upper().strip()) if w]
-    st = frames["students"]
-    cols = ["name", "father_name", "enrollment_no", "rolls", "exams", "last_exam", "gender"]
-    if not words or st.empty:
-        return pd.DataFrame(columns=cols)
-    text = st["name"].fillna("").astype(str).str.upper()
-    if include_parents:
-        text = text + " | " + st["father_name"].fillna("").astype(str).str.upper() + " | " + \
-               st["mother_name"].fillna("").astype(str).str.upper()
-    mask = pd.Series(True, index=st.index)
-    for w in words:
-        mask &= text.str.contains(w, regex=False)
-    hit = st[mask].copy()
-    if hit.empty:
-        return pd.DataFrame(columns=cols)
-    hit["_key"] = hit.apply(_person_key, axis=1)
-    hit["_order"] = hit["session"].map(session_sort_key)
+def student_workbook(res, extras=None):
+    """The whole search result as an Excel file (bytes): Profile, Exams, Marksheets, Papers, Attestation, Sitting."""
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        prof = {"roll numbers": ", ".join(res.get("rolls", [])), **res.get("profile", {})}
+        pd.DataFrame({"field": list(prof), "value": [str(v) for v in prof.values()]}).to_excel(xw, sheet_name="Profile", index=False)
+        res["exams"].to_excel(xw, sheet_name="Exams", index=False)
+        marks, papers = [], []
+        for d in res["details"]:
+            tag = {"session": d["key"]["session"], "exam_code": d["key"]["exam_code"], "roll_no": d["key"]["roll_no"]}
+            marks.append({**tag, **{k: (v if isinstance(v, (int, float, str)) else str(v)) for k, v in d["marksheet"].items()}})
+            for _, r in d["papers"].iterrows():
+                papers.append({**tag, **r.to_dict()})
+        pd.DataFrame(marks).to_excel(xw, sheet_name="Marksheets", index=False)
+        pd.DataFrame(papers).to_excel(xw, sheet_name="Papers", index=False)
+        for name, key in (("Attestation PDFs", "attestation"), ("Sitting plans", "sitting")):
+            df = (extras or {}).get(key)
+            if df is not None and not df.empty:
+                df.to_excel(xw, sheet_name=name, index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                width = min(max((len(str(c.value)) for c in col if c.value is not None), default=8) + 2, 50)
+                ws.column_dimensions[col[0].column_letter].width = width
+    return buf.getvalue()
