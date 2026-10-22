@@ -298,6 +298,14 @@ def find_student(frames, query, link_enrollment=True):
         res["linked"] = set(linked["roll_no"].astype(str)) != rolls
         rolls |= set(linked["roll_no"].astype(str))
 
+    return _build_student(frames, rolls, q, res["linked"])
+
+
+def _build_student(frames, rolls, q, linked=False):
+    """The full result (profile, exams, details) for a set of roll numbers."""
+    st, ms, pp = frames["students"], frames["marksheets"], frames["papers"]
+    res = {"query": q, "found": False, "rolls": [], "profile": {}, "names": [], "exams": pd.DataFrame(),
+           "details": [], "linked": linked}
     students = st[st["roll_no"].astype(str).isin(rolls)].copy()
     keys = ["session", "exam_code", "roll_no"]
     marks = ms[ms["roll_no"].astype(str).isin(rolls)] if not ms.empty else ms
@@ -342,6 +350,67 @@ def find_student(frames, query, link_enrollment=True):
     res["rolls"] = sorted(rolls)
     res["found"] = True
     return res
+
+
+def _person_key(row):
+    enr = str(row.get("enrollment_no") or "").strip().upper()
+    if enr and enr != "NAN":
+        return "E:" + enr
+    return "N:" + norm_name(row.get("name")) + "|" + norm_name(row.get("father_name"))
+
+
+def norm_name(text):
+    return re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
+
+
+def search_students(frames, query, include_parents=False, limit=200):
+    """Students whose name contains every word of `query` (any order, any case, part of a word is enough):
+    'akash' finds Akash Sharma, Akash Verma, Ram Akash, Aakash ...
+    One row per PERSON (same enrollment number, else same name + father), with all of their roll numbers."""
+    words = [w for w in re.split(r"\s+", str(query).upper().strip()) if w]
+    st = frames["students"]
+    cols = ["name", "father_name", "enrollment_no", "rolls", "exams", "last_exam", "gender"]
+    if not words or st.empty:
+        return pd.DataFrame(columns=cols)
+    text = st["name"].fillna("").astype(str).str.upper()
+    if include_parents:
+        text = text + " | " + st["father_name"].fillna("").astype(str).str.upper() + " | " + \
+               st["mother_name"].fillna("").astype(str).str.upper()
+    mask = pd.Series(True, index=st.index)
+    for w in words:
+        mask &= text.str.contains(w, regex=False)
+    hit = st[mask].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=cols)
+    hit["_key"] = hit.apply(_person_key, axis=1)
+    hit["_order"] = hit["session"].map(session_sort_key)
+    rows = []
+    for key, g in hit.groupby("_key", sort=False):
+        g = g.sort_values("_order", ascending=False)
+        latest = g.iloc[0]
+        rows.append({"name": latest.get("name"), "father_name": latest.get("father_name"),
+                     "enrollment_no": latest.get("enrollment_no"),
+                     "rolls": sorted({str(r) for r in g["roll_no"]}), "exams": len(g),
+                     "last_exam": f"{latest.get('session')} {latest.get('class_label') or latest.get('exam_code')}",
+                     "gender": latest.get("gender")})
+    out = pd.DataFrame(rows, columns=cols)
+    first = words[0]
+    out["_rank"] = out["name"].fillna("").astype(str).str.upper().map(
+        lambda n: 0 if n.startswith(first) else (1 if (" " + first) in (" " + n) else 2))
+    out = out.sort_values(["_rank", "name"]).drop(columns="_rank").reset_index(drop=True)
+    return out.head(limit)
+
+
+def similar_names(frames, query, n=8):
+    """Spellings in the data that are close to what was typed - for 'did you mean'."""
+    import difflib
+    names = sorted({str(x).strip().upper() for x in frames["students"]["name"].dropna()}) if len(frames["students"]) else []
+    return difflib.get_close_matches(str(query).strip().upper(), names, n=n, cutoff=0.6)
+
+
+def student_for_rolls(frames, rolls, label=""):
+    """The full result of one person whose roll numbers are already known (from search_students)."""
+    return _build_student(frames, {str(r) for r in rolls}, label, len(set(map(str, rolls))) > 1)
 
 
 def student_extras(res, attestation=None, sitting=None):
